@@ -96,9 +96,9 @@ $$\text{Score}_{\text{sentence}} = \exp \left(-\xi \cdot \frac{|\hat{S} - S|}{S}
 $$\text{FullChain} = \frac{S_{FA} + S_{AC} + S_{CS}}{3}$$
 
 Where:
-- \(S_{FA}\): Fact-to-article consistency (Naive Bayes posterior probability)
-- \(S_{AC}\): Article-to-charge consistency (association matrix)
-- \(S_{CS}\): Charge-to-sentence consistency (truncated normal distribution)
+- $S_{FA}$: Fact-to-article consistency (Naive Bayes posterior probability)
+- $S_{AC}$: Article-to-charge consistency (association matrix)
+- $S_{CS}$: Charge-to-sentence consistency (truncated normal distribution)
 
 ## 🛠️ Installation
 
@@ -281,9 +281,9 @@ The composite reward is defined as:
 $$\mathcal{R} = \alpha R_{\mathrm{legal}} + \beta R_{\mathrm{structure}} + \gamma R_{\mathrm{consistency}}$$
 
 Default values:
-- \(\alpha = 0.75\) (Legal prediction quality)
-- \(\beta = 0.0625\) (Reasoning structure completeness)
-- \(\gamma = 0.1875\) (Cross-step consistency)
+- $\alpha = 0.75$ (Legal prediction quality)
+- $\beta = 0.0625$ (Reasoning structure completeness)
+- $\gamma = 0.1875$ (Cross-step consistency)
 
 ### Token-Level Optimization
 
@@ -347,9 +347,9 @@ JPO consistently improves performance across CAIL2018 and LawBench:
 #### Legal Prediction Reward
 $$R_{\mathrm{legal}} = \alpha_1R_{\mathrm{format}} + \alpha_2R_{\mathrm{article}} + \alpha_3R_{\mathrm{charge}} + \alpha_4R_{\mathrm{sentence}}$$
 
-- **Article**: \(R_{\mathrm{article}} = \frac{|\hat{A}\cap A|}{|\hat{A}|} \cdot \frac{|\hat{A}\cap A|}{|A|}\)
-- **Charge**: \(R_{\mathrm{charge}} = \frac{|\hat{C}\cap C|}{|\hat{C}|} \cdot \frac{|\hat{C}\cap C|}{|C|}\)
-- **Sentence**: \(R_{\mathrm{sentence}} = \exp \left(-\xi \frac{|\hat{S} - S|}{S}\right)\)
+- **Article**: $R_{\mathrm{article}} = \frac{|\hat{A}\cap A|}{|\hat{A}|} \cdot \frac{|\hat{A}\cap A|}{|A|}$
+- **Charge**: $R_{\mathrm{charge}} = \frac{|\hat{C}\cap C|}{|\hat{C}|} \cdot \frac{|\hat{C}\cap C|}{|C|}$
+- **Sentence**: $R_{\mathrm{sentence}} = \exp \left(-\xi \frac{|\hat{S} - S|}{S}\right)$
 
 #### Reasoning Structure Reward
 $$R_{\mathrm{structure}} = \sum_{k\in \{f,a,c,s\}}w_k\mathbb{I}(G_k)\left[\min (\log (1 + \eta \ell_k),1)\right]$$
