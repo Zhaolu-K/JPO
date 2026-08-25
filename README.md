@@ -11,7 +11,7 @@ Large language models (LLMs) have shown strong performance on reasoning-intensiv
 - 🎯 **Core Research Question**: How can large language models be guided to learn to generate legally grounded structured reasoning chains that organically connect case facts → statutory articles → charges → sentencing outcomes?
 - 🔍 **Structured Reasoning Framework**: Four-step reasoning template (fact extraction → statutory analysis → charge determination → sentence prediction) aligned with judicial adjudication trajectory
 - 🎓 **Two-Stage Post-Training**: Structured SFT with teacher-generated rationales followed by reinforcement learning with composite rewards
-- 🏆 **Composite Reward Design**: Legal prediction quality (\(R_{\mathrm{legal}}\)), reasoning structure completeness (\(R_{\mathrm{structure}}\)), and cross-step consistency (\(R_{\mathrm{consistency}}\))
+- 🏆 **Composite Reward Design**: Legal prediction quality ($R_{\mathrm{legal}}$), reasoning structure completeness ($R_{\mathrm{structure}}$), and cross-step consistency ($R_{\mathrm{consistency}}$)
 - ⚡ **Token-Level Optimization**: Token-level advantage reweighting and adaptive policy clipping for legally salient reasoning segments
 - 🌐 **Multi-Benchmark Evaluation**: JPO-Dataset (newly constructed), CAIL2018, and LawBench across five open-source backbones
 
