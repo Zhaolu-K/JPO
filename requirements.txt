@@ -1,0 +1,5 @@
+verl==0.4.0
+vllm==0.8.0
+ray[cgraph]==2.54.0
+flash-attn==2.7.3
+cachetools==7.0.1
