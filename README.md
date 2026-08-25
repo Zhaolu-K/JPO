@@ -25,7 +25,7 @@ Large language models (LLMs) have shown strong performance on reasoning-intensiv
 
 - ✅ **Structured SFT Establishes Reasoning Template**: Teacher-generated four-step rationales teach models a stable and interpretable reasoning format, yielding large improvements over pre-trained models.
 - 🎯 **RL Refines Legal Grounding**: Reinforcement learning with composite rewards further improves legal coherence and decision calibration beyond template acquisition alone.
-- 🔗 **Cross-Step Consistency Matters**: The consistency reward (\(R_{\mathrm{consistency}}\)) contributes significantly to sentence prediction and Full-Chain Consistency, with charge-to-sentence consistency showing the largest gains.
+- 🔗 **Cross-Step Consistency Matters**: The consistency reward ($R_{\mathrm{consistency}}$) contributes significantly to sentence prediction and Full-Chain Consistency, with charge-to-sentence consistency showing the largest gains.
 - 💡 **Token-Level Optimization is Effective**: Token-level advantage reweighting and adaptive clipping improve performance by focusing updates on legally important tokens while preserving stable generation.
 - 🌏 **Generalizes Across Backbones and Benchmarks**: JPO consistently improves performance across Qwen2.5-3B/7B, Qwen3-4B, Llama-3.2-3B, and Llama-3-8B on JPO-Dataset, CAIL2018, and LawBench.
 
