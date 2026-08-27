@@ -44,6 +44,7 @@ JPO/
 │   ├── reward.py                                      # Reward function implementation
 │   ├── legal_naive_bayes.py                           # Naive Bayes for fact-article consistency
 │   └── make_json_file_accusation_to_term_mean_std.py  # Sentence statistics
+├── verl/                                              # Reinforcement learning framework improved according to this method
 ├── eval.py                                            # Generate judgments on test set
 ├── acc_score.py                                       # Score model outputs
 ├── metrics.py                                         # Evaluation metrics
