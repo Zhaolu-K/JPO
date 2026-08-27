@@ -111,7 +111,7 @@ Where:
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/yourusername/JPO.git
+   git clone https://github.com/Zhaolu-K/JPO.git
    cd JPO
    ```
 
