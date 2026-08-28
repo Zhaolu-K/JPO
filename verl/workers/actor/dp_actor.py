@@ -314,6 +314,73 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def _compute_micro_batch_policy_loss(self, data, temperature, multi_turn, weight_per_token, advantage_per_seq, metrics):
+        """Compute the policy loss of a single micro batch.
+
+        ``metrics`` is updated in place with the kl loss entries when kl loss is enabled.
+
+        Returns:
+            policy_loss, pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+        """
+        responses = data["responses"]
+        response_length = responses.size(1)
+        attention_mask = data["attention_mask"]
+        if multi_turn:
+            response_mask = data["loss_mask"][:, -response_length:]
+        else:
+            response_mask = attention_mask[:, -response_length:]
+
+        old_log_prob = data["old_log_probs"]
+        advantages = data["advantages"]
+
+        clip_ratio = self.config.clip_ratio
+        clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+        clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+        clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
+        entropy_coeff = self.config.entropy_coeff
+        loss_agg_mode = self.config.loss_agg_mode
+
+        # all return: (bsz, response_length)
+        calculate_entropy = False
+        if entropy_coeff != 0:
+            calculate_entropy = True
+        entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature,
+                                                    calculate_entropy=calculate_entropy)
+
+        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            cliprange=clip_ratio,
+            cliprange_low=clip_ratio_low,
+            cliprange_high=clip_ratio_high,
+            weight_per_token=weight_per_token,
+            advantage_per_seq=advantage_per_seq,
+            clip_ratio_c=clip_ratio_c,
+            loss_agg_mode=loss_agg_mode,
+        )
+
+        if entropy_coeff != 0:
+            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+            # compute policy loss
+            policy_loss = pg_loss - entropy_loss * entropy_coeff
+        else:
+            policy_loss = pg_loss
+
+        if self.config.use_kl_loss:
+            ref_log_prob = data["ref_log_prob"]
+            # compute kl loss
+            kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
+            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+            metrics["actor/kl_loss"] = kl_loss.detach().item()
+            metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+        return policy_loss, pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         weight_per_token = data.non_tensor_batch["weight_per_token"]
@@ -378,62 +445,14 @@ class DataParallelPPOActor(BasePPOActor):
                         data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
                     else:
                         data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
-                    responses = data["responses"]
-                    response_length = responses.size(1)
-                    attention_mask = data["attention_mask"]
-                    if multi_turn:
-                        response_mask = data["loss_mask"][:, -response_length:]
-                    else:
-                        response_mask = attention_mask[:, -response_length:]
-
-                    old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
-
-                    clip_ratio = self.config.clip_ratio
-                    clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                    clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                    clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                    entropy_coeff = self.config.entropy_coeff
-                    loss_agg_mode = self.config.loss_agg_mode
-
-                    # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature,
-                                                                calculate_entropy=calculate_entropy)
-
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
+                    policy_loss, pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = self._compute_micro_batch_policy_loss(
+                        data=data,
+                        temperature=temperature,
+                        multi_turn=multi_turn,
                         weight_per_token=weight_per_token,
                         advantage_per_seq=advantage_per_seq,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
+                        metrics=metrics,
                     )
-
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
-
-                    if self.config.use_kl_loss:
-                        ref_log_prob = data["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

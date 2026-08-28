@@ -125,12 +125,8 @@ def call_sandbox_api(sandbox_fusion_url: str, code: str, stdin: str, compile_tim
     return None, last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
 
 
-def _process_single_case(case_index: int, stdin_data: Any, expected_output: Any, sandbox_fusion_url: str, generation: str, timeout: int, language: str, concurrent_semaphore: Optional[threading.Semaphore] = None, fn_name: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
-    """Helper function to process a single test case."""
-    api_response = None
-    error_msg = None
-    logger.info(f"Processing test case {case_index + 1}.")
-
+def _build_generation_code(generation: str, fn_name: Optional[str], language: str) -> str:
+    """Builds the code payload submitted to the sandbox for a single test case."""
     current_generation_code = generation
 
     if fn_name and language == "python":
@@ -232,6 +228,14 @@ if __name__ == '__main__':
 """
         current_generation_code = wrapper_code
 
+    return current_generation_code
+
+
+def _call_sandbox_for_case(case_index: int, stdin_data: Any, sandbox_fusion_url: str, current_generation_code: str, timeout: int, language: str, concurrent_semaphore: Optional[threading.Semaphore] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Helper function to call the sandbox API for a single test case."""
+    api_response = None
+    error_msg = None
+
     try:
         if concurrent_semaphore:
             # logger.debug(f"Case {case_index + 1}: Attempting to acquire semaphore.")
@@ -246,6 +250,11 @@ if __name__ == '__main__':
         logger.error(f"Case {case_index + 1}: {error_msg}")
         traceback.print_exc()
 
+    return api_response, error_msg
+
+
+def _build_case_metadata(case_index: int, stdin_data: Any, expected_output: Any, error_msg: Optional[str]) -> Dict[str, Any]:
+    """Helper function to build the initial metadata for a single test case."""
     metadata = {
         "case_index": case_index,
         "input": str(stdin_data),
@@ -263,100 +272,138 @@ if __name__ == '__main__':
         "compile_status": None,
         "run_status": None,
     }
+    return metadata
+
+
+def _record_api_error(case_index: int, stdin_data: Any, generation: str, error_msg: str, metadata: Dict[str, Any]) -> int:
+    """Helper function to record an API request failure for a single test case."""
+    metadata["status"] = "api_error"
+    result_status = -1  # API request itself failed (includes timeout after retries)
+    logger.error(f"Case {case_index}: API error occurred: {error_msg}")
+    # Log code and input only on error for brevity
+    generation_to_log = generation[:200] + "..." if len(generation) > 200 else generation
+    logger.error(f"Case {case_index}: code: {generation_to_log}")
+    logger.error(f"Case {case_index}: input: {str(stdin_data)}")
+    return result_status
+
+
+def _classify_failed_status(api_response: Dict[str, Any], compile_result: Any, run_result: Any, metadata: Dict[str, Any]) -> int:
+    """Helper function to classify a Failed API status into a compile/run error."""
+    # --- Add debug logging ---
+    logger.debug(f"API returned Failed status. Response: {api_response}")
+    logger.debug(f"Compile Result: {compile_result}")
+    logger.debug(f"Run Result: {run_result}")
+    # --- Check the logic here ---
+    # Compile failed or timed out
+    is_compile_error = compile_result and (metadata["compile_status"] in ["Error", "TimeLimitExceeded"] or (metadata["compile_status"] == "Finished" and compile_result.get("return_code") != 0))
+    if is_compile_error:
+        # Differentiate between compile_error and compile_timeout based on specific status
+        if metadata["compile_status"] == "TimeLimitExceeded":
+            metadata["status"] = "compile_timeout"
+        else:  # Includes Error and Finished but return_code != 0 cases
+            metadata["status"] = "compile_error"
+        result_status = -4
+    # Run failed or timed out
+    elif run_result:
+        # Modified condition: Check for TimeLimitExceeded OR (Finished with non-zero exit code) OR Error status
+        is_runtime_error = metadata["run_status"] == "TimeLimitExceeded" or metadata["run_status"] == "Error" or (metadata["run_status"] == "Finished" and run_result.get("return_code") != 0)
+        if is_runtime_error:
+            if metadata["run_status"] == "TimeLimitExceeded":
+                metadata["status"] = "timeout"  # Runtime timeout
+                result_status = -3
+            else:  # Includes Error and Finished with non-zero return_code
+                metadata["status"] = "runtime_error"
+                result_status = -2
+        else:
+            # Other Failed status with run_result, classify as unknown failure
+            logger.warning(f"Unknown run_status '{metadata['run_status']}' or state within Failed API status.")
+            metadata["status"] = "unknown_failure"
+            result_status = -1  # Default to -1
+    else:
+        # Status is Failed but neither a clear compile error nor run_result exists
+        logger.warning("API status Failed but cannot determine specific error type (compile/run).")
+        metadata["status"] = "unknown_failure_state"
+        result_status = -1  # Default to -1
+    return result_status
+
+
+def _classify_success_status(expected_output: Any, run_result: Any, metadata: Dict[str, Any]) -> Any:
+    """Helper function to classify a Success API status by comparing the outputs."""
+    # Run completed successfully, now check the answer
+    if run_result and metadata["run_status"] == "Finished":
+        actual_output = metadata["stdout"] if metadata["stdout"] is not None else ""
+        # Note: Output might contain trailing newlines, need normalization
+        if str(actual_output).rstrip("\n") == str(expected_output).rstrip("\n"):
+            result_status = True
+            metadata["status"] = "success"
+        else:
+            result_status = False
+            metadata["status"] = "wrong_answer"
+    else:
+        # Status is Success but run_result status is not Finished, this is unexpected
+        metadata["status"] = "unexpected_success_state"
+        result_status = -1  # Classify as unknown error
+    return result_status
+
+
+def _classify_api_response(case_index: int, expected_output: Any, api_response: Dict[str, Any], metadata: Dict[str, Any]) -> Any:
+    """Helper function to fill in the metadata of a single test case from the API response."""
+    # --- Add debug logging ---
+    logger.debug(f"Case {case_index}: API Response: {api_response}")
+    metadata["api_response"] = api_response
+    metadata["api_status"] = api_response.get("status")
+    compile_result = api_response.get("compile_result")
+    run_result = api_response.get("run_result")
+
+    # Extract compile information
+    if compile_result:
+        metadata["compile_status"] = compile_result.get("status")
+        metadata["compile_duration"] = compile_result.get("execution_time")
+        metadata["compile_stderr"] = compile_result.get("stderr")
+
+    # Extract run information
+    if run_result:
+        metadata["run_status"] = run_result.get("status")
+        metadata["stdout"] = run_result.get("stdout")
+        metadata["stderr"] = run_result.get("stderr")  # stderr during runtime
+        metadata["exit_code"] = run_result.get("return_code")
+        metadata["duration"] = run_result.get("execution_time")
+
+    # --- Determine status based on API response ---
+    api_status = metadata["api_status"]
+
+    if api_status == "SandboxError":
+        metadata["status"] = "sandbox_error"
+        result_status = -1  # Internal sandbox error
+    elif api_status == "Failed":
+        result_status = _classify_failed_status(api_response, compile_result, run_result, metadata)
+    elif api_status == "Success":
+        result_status = _classify_success_status(expected_output, run_result, metadata)
+    else:
+        # API returned an unknown top-level status
+        logger.warning(f"Unknown API status received: {api_status}")
+        metadata["status"] = f"unknown_api_status_{api_status}"
+        result_status = -1  # Default to -1
+    return result_status
+
+
+def _process_single_case(case_index: int, stdin_data: Any, expected_output: Any, sandbox_fusion_url: str, generation: str, timeout: int, language: str, concurrent_semaphore: Optional[threading.Semaphore] = None, fn_name: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
+    """Helper function to process a single test case."""
+    api_response = None
+    error_msg = None
+    logger.info(f"Processing test case {case_index + 1}.")
+
+    current_generation_code = _build_generation_code(generation, fn_name, language)
+
+    api_response, error_msg = _call_sandbox_for_case(case_index, stdin_data, sandbox_fusion_url, current_generation_code, timeout, language, concurrent_semaphore)
+
+    metadata = _build_case_metadata(case_index, stdin_data, expected_output, error_msg)
     result_status = -1  # Default error: API request error or unknown sandbox error
 
     if error_msg:
-        metadata["status"] = "api_error"
-        result_status = -1  # API request itself failed (includes timeout after retries)
-        logger.error(f"Case {case_index}: API error occurred: {error_msg}")
-        # Log code and input only on error for brevity
-        generation_to_log = generation[:200] + "..." if len(generation) > 200 else generation
-        logger.error(f"Case {case_index}: code: {generation_to_log}")
-        logger.error(f"Case {case_index}: input: {str(stdin_data)}")
+        result_status = _record_api_error(case_index, stdin_data, generation, error_msg, metadata)
     elif api_response:
-        # --- Add debug logging ---
-        logger.debug(f"Case {case_index}: API Response: {api_response}")
-        metadata["api_response"] = api_response
-        metadata["api_status"] = api_response.get("status")
-        compile_result = api_response.get("compile_result")
-        run_result = api_response.get("run_result")
-
-        # Extract compile information
-        if compile_result:
-            metadata["compile_status"] = compile_result.get("status")
-            metadata["compile_duration"] = compile_result.get("execution_time")
-            metadata["compile_stderr"] = compile_result.get("stderr")
-
-        # Extract run information
-        if run_result:
-            metadata["run_status"] = run_result.get("status")
-            metadata["stdout"] = run_result.get("stdout")
-            metadata["stderr"] = run_result.get("stderr")  # stderr during runtime
-            metadata["exit_code"] = run_result.get("return_code")
-            metadata["duration"] = run_result.get("execution_time")
-
-        # --- Determine status based on API response ---
-        api_status = metadata["api_status"]
-
-        if api_status == "SandboxError":
-            metadata["status"] = "sandbox_error"
-            result_status = -1  # Internal sandbox error
-        elif api_status == "Failed":
-            # --- Add debug logging ---
-            logger.debug(f"API returned Failed status. Response: {api_response}")
-            logger.debug(f"Compile Result: {compile_result}")
-            logger.debug(f"Run Result: {run_result}")
-            # --- Check the logic here ---
-            # Compile failed or timed out
-            is_compile_error = compile_result and (metadata["compile_status"] in ["Error", "TimeLimitExceeded"] or (metadata["compile_status"] == "Finished" and compile_result.get("return_code") != 0))
-            if is_compile_error:
-                # Differentiate between compile_error and compile_timeout based on specific status
-                if metadata["compile_status"] == "TimeLimitExceeded":
-                    metadata["status"] = "compile_timeout"
-                else:  # Includes Error and Finished but return_code != 0 cases
-                    metadata["status"] = "compile_error"
-                result_status = -4
-            # Run failed or timed out
-            elif run_result:
-                # Modified condition: Check for TimeLimitExceeded OR (Finished with non-zero exit code) OR Error status
-                is_runtime_error = metadata["run_status"] == "TimeLimitExceeded" or metadata["run_status"] == "Error" or (metadata["run_status"] == "Finished" and run_result.get("return_code") != 0)
-                if is_runtime_error:
-                    if metadata["run_status"] == "TimeLimitExceeded":
-                        metadata["status"] = "timeout"  # Runtime timeout
-                        result_status = -3
-                    else:  # Includes Error and Finished with non-zero return_code
-                        metadata["status"] = "runtime_error"
-                        result_status = -2
-                else:
-                    # Other Failed status with run_result, classify as unknown failure
-                    logger.warning(f"Unknown run_status '{metadata['run_status']}' or state within Failed API status.")
-                    metadata["status"] = "unknown_failure"
-                    result_status = -1  # Default to -1
-            else:
-                # Status is Failed but neither a clear compile error nor run_result exists
-                logger.warning("API status Failed but cannot determine specific error type (compile/run).")
-                metadata["status"] = "unknown_failure_state"
-                result_status = -1  # Default to -1
-        elif api_status == "Success":
-            # Run completed successfully, now check the answer
-            if run_result and metadata["run_status"] == "Finished":
-                actual_output = metadata["stdout"] if metadata["stdout"] is not None else ""
-                # Note: Output might contain trailing newlines, need normalization
-                if str(actual_output).rstrip("\n") == str(expected_output).rstrip("\n"):
-                    result_status = True
-                    metadata["status"] = "success"
-                else:
-                    result_status = False
-                    metadata["status"] = "wrong_answer"
-            else:
-                # Status is Success but run_result status is not Finished, this is unexpected
-                metadata["status"] = "unexpected_success_state"
-                result_status = -1  # Classify as unknown error
-        else:
-            # API returned an unknown top-level status
-            logger.warning(f"Unknown API status received: {api_status}")
-            metadata["status"] = f"unknown_api_status_{api_status}"
-            result_status = -1  # Default to -1
+        result_status = _classify_api_response(case_index, expected_output, api_response, metadata)
     else:  # api_response is None and no error_msg (Should not happen with current call_sandbox_api logic)
         metadata["status"] = "unknown_api_state"
         result_status = -1

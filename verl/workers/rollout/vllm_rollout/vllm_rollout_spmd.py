@@ -93,35 +93,9 @@ class vLLMRollout(BaseRollout):
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
-        if kwargs.get("train_tp") is not None:
-            # deployed with megatron
-            import os
+        self._maybe_init_vllm_parallel_state(tensor_parallel_size, kwargs)
 
-            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
-            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
-            if vllm_version in (
-                "0.5.4",
-                "0.6.3",
-            ):
-                train_tp = kwargs.get("train_tp")
-                num_tp_per_train_tp = train_tp // tensor_parallel_size
-                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
-            else:
-                vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
-
-        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
-        if not rope_scaling_config:
-            max_position_embeddings = None
-            if hasattr(model_hf_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.max_position_embeddings
-            elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
-            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
-            if max_position_embeddings is None:
-                raise ValueError("max_position_embeddings not found in model_hf_config")
-
-            assert max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
+        self._check_model_context_length(config, model_hf_config)
 
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
 
@@ -174,6 +148,46 @@ class vLLMRollout(BaseRollout):
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
 
+        kwargs = self._build_sampling_params_kwargs(config)
+
+        print(f"kwargs: {kwargs}")
+        self.sampling_params = SamplingParams(**kwargs)
+
+        self.pad_token_id = tokenizer.pad_token_id
+
+    def _maybe_init_vllm_parallel_state(self, tensor_parallel_size, kwargs):
+        if kwargs.get("train_tp") is not None:
+            # deployed with megatron
+            import os
+
+            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
+            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
+            if vllm_version in (
+                "0.5.4",
+                "0.6.3",
+            ):
+                train_tp = kwargs.get("train_tp")
+                num_tp_per_train_tp = train_tp // tensor_parallel_size
+                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
+            else:
+                vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
+
+    def _check_model_context_length(self, config, model_hf_config):
+        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+        if not rope_scaling_config:
+            max_position_embeddings = None
+            if hasattr(model_hf_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.max_position_embeddings
+            elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
+            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
+            if max_position_embeddings is None:
+                raise ValueError("max_position_embeddings not found in model_hf_config")
+
+            assert max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
+
+    def _build_sampling_params_kwargs(self, config):
         kwargs = dict(
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
@@ -189,10 +203,7 @@ class vLLMRollout(BaseRollout):
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
 
-        print(f"kwargs: {kwargs}")
-        self.sampling_params = SamplingParams(**kwargs)
-
-        self.pad_token_id = tokenizer.pad_token_id
+        return kwargs
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -209,6 +220,77 @@ class vLLMRollout(BaseRollout):
         # if len(old_sampling_params_args):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
+
+    def _build_vllm_inputs(self, non_tensor_batch, idx, batch_size):
+        if "raw_prompt_ids" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+
+        if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
+            raise RuntimeError("vllm sharding manager is not work properly.")
+
+        if "multi_modal_data" in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data")):
+                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+        else:
+            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
+
+        # ensure the type of `prompt_token_ids` passed to vllm is list[int]
+        # https://github.com/volcengine/verl/pull/772
+        for input_data in vllm_inputs:
+            if isinstance(input_data["prompt_token_ids"], np.ndarray):
+                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
+            elif not isinstance(input_data["prompt_token_ids"], list):
+                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+
+        return vllm_inputs
+
+    def _resolve_generation_kwargs(self, prompts, kwargs):
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
+        if not do_sample:
+            kwargs = {
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,  # if greedy, only 1 response
+            }
+        elif is_validate:
+            # TODO: try **
+            kwargs = {
+                "top_k": self.config.val_kwargs.top_k,
+                "top_p": self.config.val_kwargs.top_p,
+                "temperature": self.config.val_kwargs.temperature,
+                "n": 1,  # if validate, already repeat in ray_trainer
+            }
+
+        return do_sample, kwargs
+
+    def _build_lora_requests(self, batch_size):
+        lora_requests = None
+        if self.lora_kwargs:
+            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
+            if len(lora_int_ids) > 0:
+                lora_int_id=lora_int_ids[0]
+                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}",lora_int_id=lora_int_id,lora_path="/simon-stub-path")] * batch_size
+
+        return lora_requests
+
+    def _collect_response_and_logprobs(self, outputs):
+        response = []
+        rollout_log_probs = []
+        for output in outputs:
+            for sample_id in range(len(output.outputs)):
+                response_ids = output.outputs[sample_id].token_ids
+                response.append(response_ids)
+                curr_log_prob = []
+                for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                    curr_log_prob.append(logprob[response_ids[i]].logprob)
+                rollout_log_probs.append(curr_log_prob)
+
+        return response, rollout_log_probs
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
@@ -235,53 +317,11 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
 
         non_tensor_batch = prompts.non_tensor_batch
-        if "raw_prompt_ids" not in non_tensor_batch:
-            non_tensor_batch["raw_prompt_ids"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+        vllm_inputs = self._build_vllm_inputs(non_tensor_batch, idx, batch_size)
 
-        if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
-            raise RuntimeError("vllm sharding manager is not work properly.")
+        do_sample, kwargs = self._resolve_generation_kwargs(prompts, kwargs)
 
-        if "multi_modal_data" in non_tensor_batch:
-            vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data")):
-                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
-        else:
-            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
-
-        # ensure the type of `prompt_token_ids` passed to vllm is list[int]
-        # https://github.com/volcengine/verl/pull/772
-        for input_data in vllm_inputs:
-            if isinstance(input_data["prompt_token_ids"], np.ndarray):
-                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
-            elif not isinstance(input_data["prompt_token_ids"], list):
-                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
-
-        do_sample = prompts.meta_info.get("do_sample", True)
-        is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = {
-                "best_of": 1,
-                "top_p": 1.0,
-                "top_k": -1,
-                "min_p": 0.0,
-                "temperature": 0,
-                "n": 1,  # if greedy, only 1 response
-            }
-        elif is_validate:
-            # TODO: try **
-            kwargs = {
-                "top_k": self.config.val_kwargs.top_k,
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
-                "n": 1,  # if validate, already repeat in ray_trainer
-            }
-
-        lora_requests = None
-        if self.lora_kwargs:
-            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id=lora_int_ids[0]
-                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}",lora_int_id=lora_int_id,lora_path="/simon-stub-path")] * batch_size
+        lora_requests = self._build_lora_requests(batch_size)
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -295,16 +335,7 @@ class vLLMRollout(BaseRollout):
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
-            response = []
-            rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
-                    curr_log_prob = []
-                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                        curr_log_prob.append(logprob[response_ids[i]].logprob)
-                    rollout_log_probs.append(curr_log_prob)
+            response, rollout_log_probs = self._collect_response_and_logprobs(outputs)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
             rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)

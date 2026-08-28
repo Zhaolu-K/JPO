@@ -42,14 +42,7 @@ def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
-def get_model(
-    model_provider_func,
-    model_type=ModelType.encoder_or_decoder,
-    wrap_with_ddp=True,
-    use_distributed_optimizer=True,
-    transformer_config=None,
-):
-    """Build the model."""
+def _build_model_chunks(model_provider_func, model_type):
     # Build model.
     if mpu.get_pipeline_model_parallel_world_size() > 1 and mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
         assert model_type != ModelType.encoder_and_decoder, "Interleaved schedule not supported for model with both encoder and decoder"
@@ -81,6 +74,40 @@ def get_model(
         else:
             model = model_provider_func(pre_process=pre_process, post_process=post_process)
         model.model_type = model_type
+    return model
+
+
+def _wrap_model_with_ddp(model, tfconfig, use_distributed_optimizer):
+    ddp_models = []
+    for model_chunk_idx, model_chunk in enumerate(model):
+        ddp_model = DDP(
+            config=tfconfig,
+            module=model_chunk,
+            disable_bucketing=(model_chunk_idx > 0),
+            ddp_config=DistributedDataParallelConfig(
+                overlap_grad_reduce=False,
+                use_distributed_optimizer=use_distributed_optimizer,
+                grad_reduce_in_fp32=True,  # [old] accumulate_allreduce_grads_in_fp32=True,
+            ),
+        )
+        ddp_models.append(ddp_model)
+    model = ddp_models
+    # # Broadcast params from data parallel src rank to other data parallel ranks.
+    # # if args.data_parallel_random_init:
+    for model_module in model:
+        model_module.broadcast_params()
+    return model
+
+
+def get_model(
+    model_provider_func,
+    model_type=ModelType.encoder_or_decoder,
+    wrap_with_ddp=True,
+    use_distributed_optimizer=True,
+    transformer_config=None,
+):
+    """Build the model."""
+    model = _build_model_chunks(model_provider_func, model_type)
 
     if not isinstance(model, list):
         model = [model]
@@ -117,24 +144,7 @@ def get_model(
         model = [Float16Module(config, model_module) for model_module in model]
 
     if wrap_with_ddp:
-        ddp_models = []
-        for model_chunk_idx, model_chunk in enumerate(model):
-            ddp_model = DDP(
-                config=tfconfig,
-                module=model_chunk,
-                disable_bucketing=(model_chunk_idx > 0),
-                ddp_config=DistributedDataParallelConfig(
-                    overlap_grad_reduce=False,
-                    use_distributed_optimizer=use_distributed_optimizer,
-                    grad_reduce_in_fp32=True,  # [old] accumulate_allreduce_grads_in_fp32=True,
-                ),
-            )
-            ddp_models.append(ddp_model)
-        model = ddp_models
-        # # Broadcast params from data parallel src rank to other data parallel ranks.
-        # # if args.data_parallel_random_init:
-        for model_module in model:
-            model_module.broadcast_params()
+        model = _wrap_model_with_ddp(model, tfconfig, use_distributed_optimizer)
     return model
 
 
@@ -467,6 +477,63 @@ def get_rng_states_checkpoint_path(checkpoint_path, only_rank0_save=True):
     return os.path.join(checkpoint_path, "rng_states", f"rng_states_pp{pp_rank}_tp{tp_rank}_cp{cp_rank}_dp{dp_rank}.pt")
 
 
+def _convert_self_attention_param(name, param, new_params, convert_qkv_shard, convert_qkv_gate_up_by_trunk_concat):
+    splitted_name = name.split(".")
+    layer_number = splitted_name[2]
+    component = splitted_name[4]
+    param_type = splitted_name[5]
+    if component == "linear_proj":
+        new_params[f"model.layers.{layer_number}.self_attn.o_proj.weight"] = param
+    elif component == "linear_qkv" and not isinstance(param, list):
+        if param_type == "layer_norm_weight":
+            new_params[f"model.layers.{layer_number}.input_layernorm.weight"] = param
+        else:
+            if convert_qkv_gate_up_by_trunk_concat:
+                convert_qkv_shard(
+                    param,
+                    f"model.layers.{layer_number}.self_attn.q_proj.{param_type}",
+                    f"model.layers.{layer_number}.self_attn.k_proj.{param_type}",
+                    f"model.layers.{layer_number}.self_attn.v_proj.{param_type}",
+                )
+            else:
+                new_params[f"model.layers.{layer_number}.self_attn.qkv_proj.{param_type}"] = param
+    elif component == "q_layernorm" or component == "k_layernorm":
+        hf_component = component.replace("layer", "")
+        new_params[f"model.layers.{layer_number}.self_attn.{hf_component}.weight"] = param
+    else:
+        assert isinstance(param, list) and len(param) == 3
+        assert param_type == "weight" or param_type == "bias"
+        new_params[f"model.layers.{layer_number}.self_attn.q_proj.{param_type}"] = param[0]
+        new_params[f"model.layers.{layer_number}.self_attn.k_proj.{param_type}"] = param[1]
+        new_params[f"model.layers.{layer_number}.self_attn.v_proj.{param_type}"] = param[2]
+
+
+def _convert_mlp_param(name, param, new_params, convert_gate_up_shard, convert_qkv_gate_up_by_trunk_concat):
+    splitted_name = name.split(".")
+    layer_number = splitted_name[2]
+    component = splitted_name[4]
+    param_type = splitted_name[5]
+    if component == "linear_fc1" and not isinstance(param, list):
+        if param_type == "layer_norm_weight":
+            new_params[f"model.layers.{layer_number}.post_attention_layernorm.weight"] = param
+        elif param_type == "weight":
+            if convert_qkv_gate_up_by_trunk_concat:
+                convert_gate_up_shard(
+                    param,
+                    f"model.layers.{layer_number}.mlp.gate_proj.weight",
+                    f"model.layers.{layer_number}.mlp.up_proj.weight",
+                )
+            else:
+                new_params[f"model.layers.{layer_number}.mlp.gate_up_proj.weight"] = param
+    elif component == "linear_fc1" and isinstance(param, list):
+        assert len(param) == 2
+        assert param_type == "weight" or param_type == "bias"
+        new_params[f"model.layers.{layer_number}.mlp.gate_proj.weight"] = param[0]
+        new_params[f"model.layers.{layer_number}.mlp.up_proj.weight"] = param[1]
+    elif component == "linear_fc2":
+        new_params[f"model.layers.{layer_number}.mlp.down_proj.weight"] = param
+
+
 def convert_megatron_model_to_transformers_model(
     name,
     param,
@@ -546,58 +613,9 @@ def convert_megatron_model_to_transformers_model(
     if name == "embedding.word_embeddings.weight":
         new_params["model.embed_tokens.weight"] = param
     elif "self_attention" in name:
-        splitted_name = name.split(".")
-        layer_number = splitted_name[2]
-        component = splitted_name[4]
-        param_type = splitted_name[5]
-        if component == "linear_proj":
-            new_params[f"model.layers.{layer_number}.self_attn.o_proj.weight"] = param
-        elif component == "linear_qkv" and not isinstance(param, list):
-            if param_type == "layer_norm_weight":
-                new_params[f"model.layers.{layer_number}.input_layernorm.weight"] = param
-            else:
-                if convert_qkv_gate_up_by_trunk_concat:
-                    convert_qkv_shard(
-                        param,
-                        f"model.layers.{layer_number}.self_attn.q_proj.{param_type}",
-                        f"model.layers.{layer_number}.self_attn.k_proj.{param_type}",
-                        f"model.layers.{layer_number}.self_attn.v_proj.{param_type}",
-                    )
-                else:
-                    new_params[f"model.layers.{layer_number}.self_attn.qkv_proj.{param_type}"] = param
-        elif component == "q_layernorm" or component == "k_layernorm":
-            hf_component = component.replace("layer", "")
-            new_params[f"model.layers.{layer_number}.self_attn.{hf_component}.weight"] = param
-        else:
-            assert isinstance(param, list) and len(param) == 3
-            assert param_type == "weight" or param_type == "bias"
-            new_params[f"model.layers.{layer_number}.self_attn.q_proj.{param_type}"] = param[0]
-            new_params[f"model.layers.{layer_number}.self_attn.k_proj.{param_type}"] = param[1]
-            new_params[f"model.layers.{layer_number}.self_attn.v_proj.{param_type}"] = param[2]
+        _convert_self_attention_param(name, param, new_params, convert_qkv_shard, convert_qkv_gate_up_by_trunk_concat)
     elif "mlp" in name:
-        splitted_name = name.split(".")
-        layer_number = splitted_name[2]
-        component = splitted_name[4]
-        param_type = splitted_name[5]
-        if component == "linear_fc1" and not isinstance(param, list):
-            if param_type == "layer_norm_weight":
-                new_params[f"model.layers.{layer_number}.post_attention_layernorm.weight"] = param
-            elif param_type == "weight":
-                if convert_qkv_gate_up_by_trunk_concat:
-                    convert_gate_up_shard(
-                        param,
-                        f"model.layers.{layer_number}.mlp.gate_proj.weight",
-                        f"model.layers.{layer_number}.mlp.up_proj.weight",
-                    )
-                else:
-                    new_params[f"model.layers.{layer_number}.mlp.gate_up_proj.weight"] = param
-        elif component == "linear_fc1" and isinstance(param, list):
-            assert len(param) == 2
-            assert param_type == "weight" or param_type == "bias"
-            new_params[f"model.layers.{layer_number}.mlp.gate_proj.weight"] = param[0]
-            new_params[f"model.layers.{layer_number}.mlp.up_proj.weight"] = param[1]
-        elif component == "linear_fc2":
-            new_params[f"model.layers.{layer_number}.mlp.down_proj.weight"] = param
+        _convert_mlp_param(name, param, new_params, convert_gate_up_shard, convert_qkv_gate_up_by_trunk_concat)
     elif name == "decoder.final_layernorm.weight":
         new_params["model.norm.weight"] = param
     elif name == "output_layer.weight":
@@ -724,6 +742,68 @@ def default_tp_concat_fn(layer_name_mapping, name, train_params, infer_params, m
     return infer_params
 
 
+def _collect_per_tensor_meta_info(actor_module, vpp_size, pp_rank):
+    meta_info = []
+    for scan_vpp_idx in range(vpp_size):
+        existing_keys = set()
+        model = unwrap_model(actor_module[scan_vpp_idx])
+        for idx, (name, _) in enumerate(model.named_parameters()):
+            existing_keys.add(name)
+            meta_info.append((pp_rank, scan_vpp_idx, idx, name))
+        extra_keys = [x for x in model.state_dict().keys() if "_extra_state" not in x and x not in existing_keys]
+        for name in extra_keys:
+            meta_info.append((pp_rank, scan_vpp_idx, idx, name))
+    return meta_info
+
+
+def _gather_expert_infer_params(cur_name, broad_pp_tensor, weight_converter, ep_size, ep_group):
+    num_experts = weight_converter.mcore_config.num_moe_experts
+    num_experts_per_rank = num_experts // ep_size
+    infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(ep_size)]
+    torch.distributed.all_gather(infer_params, broad_pp_tensor, group=ep_group)
+
+    name_prefix, local_expert_id = cur_name.split(".weight")
+    local_expert_id = int(local_expert_id)
+    global_expert_ids = [num_experts_per_rank * ep_rank + local_expert_id for ep_rank in range(ep_size)]
+    global_expert_names = [f"{name_prefix}.weight{expert_id}" for expert_id in global_expert_ids]
+    return global_expert_names, infer_params
+
+
+def _convert_expert_param(name, param, broad_pp_tensor, weight_converter, layer_name_mapping, model_config, etp_size, etp_group, convert_qkv_gate_up_by_simple_split):
+    if etp_size > 1:
+        # gather etp
+        etp_params = [torch.empty_like(param) for _ in range(etp_size)]
+        torch.distributed.all_gather(etp_params, param, group=etp_group)
+        params = etp_params
+    else:
+        params = [param]
+
+    merge_params = default_tp_concat_fn(layer_name_mapping, name, broad_pp_tensor, params, model_config, convert_qkv_gate_up_by_simple_split)
+    if not isinstance(merge_params, list):
+        merge_params = [merge_params]
+    converted_names, converted_params = weight_converter.convert_param(name, merge_params)
+    return converted_names, converted_params
+
+
+def _gather_and_convert_param(cur_name, broad_pp_tensor, weight_converter, layer_name_mapping, model_config, all_gather_group_size, mpu, convert_qkv_gate_up_by_simple_split):
+    # tp all gather
+    if tp_utils.is_tensor_parallel_param(broad_pp_tensor):
+        # allocate a new tensor with proper size
+        if all_gather_group_size <= 1:
+            infer_params = [broad_pp_tensor]
+        else:
+            infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(all_gather_group_size)]
+            torch.distributed.all_gather(infer_params, broad_pp_tensor, group=mpu.get_tensor_model_parallel_group())
+        infer_params = default_tp_concat_fn(layer_name_mapping, cur_name, broad_pp_tensor, infer_params, model_config, convert_qkv_gate_up_by_simple_split)
+    else:
+        infer_params = broad_pp_tensor
+
+    if not isinstance(infer_params, list):
+        infer_params = [infer_params]
+    converted_names, converted_params = weight_converter.convert_param(cur_name, infer_params)
+    return converted_names, converted_params
+
+
 def per_tensor_generator(actor_module, model_config, weight_converter, transformer_config, layer_name_mapping, convert_qkv_gate_up_by_simple_split=True):
     from megatron.core import parallel_state as mpu
 
@@ -752,16 +832,7 @@ def per_tensor_generator(actor_module, model_config, weight_converter, transform
                 yield name, model.state_dict()[name].to(torch.cuda.current_device())
 
     # we need first make all rank get full model information
-    meta_info = []
-    for scan_vpp_idx in range(vpp_size):
-        existing_keys = set()
-        model = unwrap_model(actor_module[scan_vpp_idx])
-        for idx, (name, _) in enumerate(model.named_parameters()):
-            existing_keys.add(name)
-            meta_info.append((pp_rank, scan_vpp_idx, idx, name))
-        extra_keys = [x for x in model.state_dict().keys() if "_extra_state" not in x and x not in existing_keys]
-        for name in extra_keys:
-            meta_info.append((pp_rank, scan_vpp_idx, idx, name))
+    meta_info = _collect_per_tensor_meta_info(actor_module, vpp_size, pp_rank)
 
     obj_spec_output = [None] * mpu.get_pipeline_model_parallel_world_size()
     torch.distributed.all_gather_object(object_list=obj_spec_output, obj=meta_info, group=mpu.get_pipeline_model_parallel_group())
@@ -796,50 +867,108 @@ def per_tensor_generator(actor_module, model_config, weight_converter, transform
 
         # EP
         if ".mlp.experts.linear_fc" in cur_name and ep_size > 1:
-            num_experts = weight_converter.mcore_config.num_moe_experts
-            num_experts_per_rank = num_experts // ep_size
-            infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(ep_size)]
-            torch.distributed.all_gather(infer_params, broad_pp_tensor, group=ep_group)
-
-            name_prefix, local_expert_id = cur_name.split(".weight")
-            local_expert_id = int(local_expert_id)
-            global_expert_ids = [num_experts_per_rank * ep_rank + local_expert_id for ep_rank in range(ep_size)]
-            global_expert_names = [f"{name_prefix}.weight{expert_id}" for expert_id in global_expert_ids]
+            global_expert_names, infer_params = _gather_expert_infer_params(cur_name, broad_pp_tensor, weight_converter, ep_size, ep_group)
 
             for name, param in zip(global_expert_names, infer_params):
-                if etp_size > 1:
-                    # gather etp
-                    etp_params = [torch.empty_like(param) for _ in range(etp_size)]
-                    torch.distributed.all_gather(etp_params, param, group=etp_group)
-                    params = etp_params
-                else:
-                    params = [param]
-
-                merge_params = default_tp_concat_fn(layer_name_mapping, name, broad_pp_tensor, params, model_config, convert_qkv_gate_up_by_simple_split)
-                if not isinstance(merge_params, list):
-                    merge_params = [merge_params]
-                converted_names, converted_params = weight_converter.convert_param(name, merge_params)
+                converted_names, converted_params = _convert_expert_param(name, param, broad_pp_tensor, weight_converter, layer_name_mapping, model_config, etp_size, etp_group, convert_qkv_gate_up_by_simple_split)
 
                 yield from zip(converted_names, converted_params)
             continue
 
-        # tp all gather
-        if tp_utils.is_tensor_parallel_param(broad_pp_tensor):
-            # allocate a new tensor with proper size
-            if all_gather_group_size <= 1:
-                infer_params = [broad_pp_tensor]
-            else:
-                infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(all_gather_group_size)]
-                torch.distributed.all_gather(infer_params, broad_pp_tensor, group=mpu.get_tensor_model_parallel_group())
-            infer_params = default_tp_concat_fn(layer_name_mapping, cur_name, broad_pp_tensor, infer_params, model_config, convert_qkv_gate_up_by_simple_split)
-        else:
-            infer_params = broad_pp_tensor
-
-        if not isinstance(infer_params, list):
-            infer_params = [infer_params]
-        converted_names, converted_params = weight_converter.convert_param(cur_name, infer_params)
+        converted_names, converted_params = _gather_and_convert_param(cur_name, broad_pp_tensor, weight_converter, layer_name_mapping, model_config, all_gather_group_size, mpu, convert_qkv_gate_up_by_simple_split)
 
         yield from zip(converted_names, converted_params)
+
+
+def _get_uneven_transformer_layer_offset(pipeline_rank, vp_rank, config: TransformerConfig):
+    # Calculate number of pipeline stages to distribute the remaining Transformer
+    # layers after deducting the Transformer layers in the first or the last stages
+    middle_pipeline_stages = config.pipeline_model_parallel_size
+    middle_pipeline_stages -= sum(
+        [
+            1 if x is not None else 0
+            for x in (
+                config.num_layers_in_first_pipeline_stage,
+                config.num_layers_in_last_pipeline_stage,
+            )
+        ]
+    )
+
+    # Calculate layers to distribute in each pipeline stage. If the
+    # num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage
+    # are not set, we will not enable uneven pipeline. All layers will be treated
+    # as middle layers.
+    num_layers_in_first_pipeline_stage = 0 if config.num_layers_in_first_pipeline_stage is None else config.num_layers_in_first_pipeline_stage
+    num_layers_in_last_pipeline_stage = 0 if config.num_layers_in_last_pipeline_stage is None else config.num_layers_in_last_pipeline_stage
+
+    middle_num_layers = config.num_layers - num_layers_in_first_pipeline_stage - num_layers_in_last_pipeline_stage
+
+    if mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
+        vp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+
+        # Calculate number of layers in each virtual model chunk
+        # If the num_layers_in_first_pipeline_stage and
+        # num_layers_in_last_pipeline_stage are not set, all pipeline stages
+        # will be treated as middle pipeline stages in the calculation
+        num_layers_per_virtual_model_chunk_in_first_pipeline_stage = 0 if config.num_layers_in_first_pipeline_stage is None else config.num_layers_in_first_pipeline_stage // vp_size
+
+        num_layers_per_virtual_model_chunk_in_last_pipeline_stage = 0 if config.num_layers_in_last_pipeline_stage is None else config.num_layers_in_last_pipeline_stage // vp_size
+
+        num_layers_per_vritual_model_chunk_in_middle_pipeline_stage = middle_num_layers // vp_size
+
+        # First stage + middle stage + last stage
+        total_virtual_chunks = num_layers_per_virtual_model_chunk_in_first_pipeline_stage + num_layers_per_vritual_model_chunk_in_middle_pipeline_stage + num_layers_per_virtual_model_chunk_in_last_pipeline_stage
+
+        # Calculate the layer offset with interleaved uneven pipeline parallelism
+        if pipeline_rank == 0:
+            offset = vp_rank * total_virtual_chunks
+        else:
+            offset = vp_rank * total_virtual_chunks + num_layers_per_virtual_model_chunk_in_first_pipeline_stage + (pipeline_rank - 1) * (num_layers_per_vritual_model_chunk_in_middle_pipeline_stage // middle_pipeline_stages)
+    else:
+        if middle_pipeline_stages > 0:
+            num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
+        else:
+            num_layers_per_pipeline_rank = 0
+
+        middle_pipeline_rank = pipeline_rank if config.num_layers_in_first_pipeline_stage is None else pipeline_rank - 1
+
+        if pipeline_rank == 0:
+            offset = 0
+        else:
+            offset = (middle_pipeline_rank * num_layers_per_pipeline_rank) + num_layers_in_first_pipeline_stage
+    return offset
+
+
+def _get_even_transformer_layer_offset(pipeline_rank, vp_rank, config: TransformerConfig):
+    num_layers = config.num_layers
+
+    # Increase the number of layers by one if we include the embedding (loss)
+    # layer into pipeline parallelism partition and placement
+    if config.account_for_embedding_in_pipeline_split:
+        num_layers += 1
+
+    if config.account_for_loss_in_pipeline_split:
+        num_layers += 1
+
+    num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
+
+    if mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
+        vp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+
+        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+        total_virtual_chunks = num_layers // vp_size
+        offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
+
+        # Reduce the offset of embedding layer from the total layer number
+        if config.account_for_embedding_in_pipeline_split and not mpu.is_pipeline_first_stage():
+            offset -= 1
+    else:
+        offset = pipeline_rank * num_layers_per_pipeline_rank
+
+        # Reduce the offset of embedding layer from the total layer number
+        if config.account_for_embedding_in_pipeline_split and not mpu.is_pipeline_first_stage():
+            offset -= 1
+    return offset
 
 
 def get_transformer_layer_offset(pipeline_rank, vp_rank, config: TransformerConfig):
@@ -854,90 +983,9 @@ def get_transformer_layer_offset(pipeline_rank, vp_rank, config: TransformerConf
     '''
     if config.pipeline_model_parallel_size > 1:
         if config.num_layers_in_first_pipeline_stage is not None or config.num_layers_in_last_pipeline_stage is not None:
-            # Calculate number of pipeline stages to distribute the remaining Transformer
-            # layers after deducting the Transformer layers in the first or the last stages
-            middle_pipeline_stages = config.pipeline_model_parallel_size
-            middle_pipeline_stages -= sum(
-                [
-                    1 if x is not None else 0
-                    for x in (
-                        config.num_layers_in_first_pipeline_stage,
-                        config.num_layers_in_last_pipeline_stage,
-                    )
-                ]
-            )
-
-            # Calculate layers to distribute in each pipeline stage. If the
-            # num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage
-            # are not set, we will not enable uneven pipeline. All layers will be treated
-            # as middle layers.
-            num_layers_in_first_pipeline_stage = 0 if config.num_layers_in_first_pipeline_stage is None else config.num_layers_in_first_pipeline_stage
-            num_layers_in_last_pipeline_stage = 0 if config.num_layers_in_last_pipeline_stage is None else config.num_layers_in_last_pipeline_stage
-
-            middle_num_layers = config.num_layers - num_layers_in_first_pipeline_stage - num_layers_in_last_pipeline_stage
-
-            if mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
-                vp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
-
-                # Calculate number of layers in each virtual model chunk
-                # If the num_layers_in_first_pipeline_stage and
-                # num_layers_in_last_pipeline_stage are not set, all pipeline stages
-                # will be treated as middle pipeline stages in the calculation
-                num_layers_per_virtual_model_chunk_in_first_pipeline_stage = 0 if config.num_layers_in_first_pipeline_stage is None else config.num_layers_in_first_pipeline_stage // vp_size
-
-                num_layers_per_virtual_model_chunk_in_last_pipeline_stage = 0 if config.num_layers_in_last_pipeline_stage is None else config.num_layers_in_last_pipeline_stage // vp_size
-
-                num_layers_per_vritual_model_chunk_in_middle_pipeline_stage = middle_num_layers // vp_size
-
-                # First stage + middle stage + last stage
-                total_virtual_chunks = num_layers_per_virtual_model_chunk_in_first_pipeline_stage + num_layers_per_vritual_model_chunk_in_middle_pipeline_stage + num_layers_per_virtual_model_chunk_in_last_pipeline_stage
-
-                # Calculate the layer offset with interleaved uneven pipeline parallelism
-                if pipeline_rank == 0:
-                    offset = vp_rank * total_virtual_chunks
-                else:
-                    offset = vp_rank * total_virtual_chunks + num_layers_per_virtual_model_chunk_in_first_pipeline_stage + (pipeline_rank - 1) * (num_layers_per_vritual_model_chunk_in_middle_pipeline_stage // middle_pipeline_stages)
-            else:
-                if middle_pipeline_stages > 0:
-                    num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
-                else:
-                    num_layers_per_pipeline_rank = 0
-
-                middle_pipeline_rank = pipeline_rank if config.num_layers_in_first_pipeline_stage is None else pipeline_rank - 1
-
-                if pipeline_rank == 0:
-                    offset = 0
-                else:
-                    offset = (middle_pipeline_rank * num_layers_per_pipeline_rank) + num_layers_in_first_pipeline_stage
+            offset = _get_uneven_transformer_layer_offset(pipeline_rank, vp_rank, config)
         else:
-            num_layers = config.num_layers
-
-            # Increase the number of layers by one if we include the embedding (loss)
-            # layer into pipeline parallelism partition and placement
-            if config.account_for_embedding_in_pipeline_split:
-                num_layers += 1
-
-            if config.account_for_loss_in_pipeline_split:
-                num_layers += 1
-
-            num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
-
-            if mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
-                vp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
-
-                num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
-                total_virtual_chunks = num_layers // vp_size
-                offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
-
-                # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not mpu.is_pipeline_first_stage():
-                    offset -= 1
-            else:
-                offset = pipeline_rank * num_layers_per_pipeline_rank
-
-                # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not mpu.is_pipeline_first_stage():
-                    offset -= 1
+            offset = _get_even_transformer_layer_offset(pipeline_rank, vp_rank, config)
     else:
         offset = 0
     return offset

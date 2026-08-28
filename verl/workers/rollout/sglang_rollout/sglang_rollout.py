@@ -586,32 +586,7 @@ class SGLangRollout(BaseRollout):
                 dtype=object,
             )
 
-        if "multi_modal_data" in non_tensor_batch:
-            sglang_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(
-                non_tensor_batch.pop("raw_prompt_ids"),
-                non_tensor_batch.pop("multi_modal_data"),
-            ):
-                sglang_inputs.append(
-                    {
-                        "prompt_token_ids": raw_prompt_ids,
-                        "multi_modal_data": multi_modal_data,
-                        "image_data": (multi_modal_data.get("image", None) if isinstance(multi_modal_data, dict) else None),
-                    }
-                )
-        else:
-            sglang_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
-
-        # Ensure token IDs are lists or numpy arrays
-        for input_data in sglang_inputs:
-            if isinstance(input_data["prompt_token_ids"], np.ndarray):
-                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
-            elif not isinstance(input_data["prompt_token_ids"], list):
-                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
-
-        # Extract token IDs and image data for SGLang Engine
-        idx_list = [input_data["prompt_token_ids"] for input_data in sglang_inputs]
-        image_list = [input_data.get("image_data", None) for input_data in sglang_inputs]
+        idx_list, image_list = self._build_sglang_engine_inputs(non_tensor_batch)
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -719,6 +694,37 @@ class SGLangRollout(BaseRollout):
 
         return DataProto(batch=batch, non_tensor_batch=_non_tensor_batch)
 
+    def _build_sglang_engine_inputs(self, non_tensor_batch):
+        """Builds the per-request SGLang engine inputs, handling multi-modal data."""
+        if "multi_modal_data" in non_tensor_batch:
+            sglang_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(
+                non_tensor_batch.pop("raw_prompt_ids"),
+                non_tensor_batch.pop("multi_modal_data"),
+            ):
+                sglang_inputs.append(
+                    {
+                        "prompt_token_ids": raw_prompt_ids,
+                        "multi_modal_data": multi_modal_data,
+                        "image_data": (multi_modal_data.get("image", None) if isinstance(multi_modal_data, dict) else None),
+                    }
+                )
+        else:
+            sglang_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
+
+        # Ensure token IDs are lists or numpy arrays
+        for input_data in sglang_inputs:
+            if isinstance(input_data["prompt_token_ids"], np.ndarray):
+                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
+            elif not isinstance(input_data["prompt_token_ids"], list):
+                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+
+        # Extract token IDs and image data for SGLang Engine
+        idx_list = [input_data["prompt_token_ids"] for input_data in sglang_inputs]
+        image_list = [input_data.get("image_data", None) for input_data in sglang_inputs]
+
+        return idx_list, image_list
+
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
@@ -782,31 +788,7 @@ class SGLangRollout(BaseRollout):
                     if self._function_call_parser and self._function_call_parser.has_tool_call(content):
                         finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
                         _req.state = AsyncRolloutRequestStateEnum.TOOL_CALLING
-                        try:
-                            normed_content, tool_calls = self._function_call_parser.parse_non_stream(content)
-                        except JSONDecodeError:
-                            normed_content = content
-                            tool_calls = []
-                        except AttributeError:
-                            normed_content = content
-                            tool_calls = []
-                        parsed_tool_calls = []
-                        for tool_call in tool_calls:
-                            function, has_decode_error = OpenAIFunctionCallSchema.from_openai_function_parsed_schema(
-                                OpenAIFunctionParsedSchema(
-                                    name=tool_call.name,
-                                    arguments=tool_call.parameters,
-                                )
-                            )
-                            # Drop the tool call if its arguments has decode error
-                            if has_decode_error:
-                                continue
-                            parsed_tool_calls.append(
-                                OpenAIFunctionToolCall(
-                                    id=str(tool_call.tool_index),
-                                    function=function,
-                                )
-                            )
+                        normed_content, parsed_tool_calls = self._parse_tool_calls_from_content(content)
                         if len(parsed_tool_calls) > 0:
                             _req.add_assistant_message(
                                 self.tokenizer,
@@ -849,6 +831,35 @@ class SGLangRollout(BaseRollout):
         _req.finalize(self.tokenizer, tool_reward_scores, finish_reason_type)
 
         return _req
+
+    def _parse_tool_calls_from_content(self, content):
+        """Parses tool calls out of generated content, dropping ones that fail to decode."""
+        try:
+            normed_content, tool_calls = self._function_call_parser.parse_non_stream(content)
+        except JSONDecodeError:
+            normed_content = content
+            tool_calls = []
+        except AttributeError:
+            normed_content = content
+            tool_calls = []
+        parsed_tool_calls = []
+        for tool_call in tool_calls:
+            function, has_decode_error = OpenAIFunctionCallSchema.from_openai_function_parsed_schema(
+                OpenAIFunctionParsedSchema(
+                    name=tool_call.name,
+                    arguments=tool_call.parameters,
+                )
+            )
+            # Drop the tool call if its arguments has decode error
+            if has_decode_error:
+                continue
+            parsed_tool_calls.append(
+                OpenAIFunctionToolCall(
+                    id=str(tool_call.tool_index),
+                    function=function,
+                )
+            )
+        return normed_content, parsed_tool_calls
 
     async def _handle_engine_call(self, _req: AsyncRolloutRequest, do_sample: bool, is_validate: bool, override_n: bool = True, **kwargs) -> dict:
         generation_prompt_ids = _req.get_generation_prompt(self.tokenizer)

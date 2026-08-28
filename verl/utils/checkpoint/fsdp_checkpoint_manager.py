@@ -126,6 +126,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if self.lr_scheduler is not None:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
 
+    def _rotate_old_checkpoints(self, max_ckpt_to_keep):
+        # remove previous local_path
+        if max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 0 and len(self.previous_saved_paths) >= max_ckpt_to_keep:
+            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
+            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
+            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
         """
         Save an FSDP checkpoint for this rank.
@@ -150,11 +157,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # record the previous global step
         self.previous_global_step = global_step
 
-        # remove previous local_path
-        if max_ckpt_to_keep and isinstance(max_ckpt_to_keep, int) and max_ckpt_to_keep > 0 and len(self.previous_saved_paths) >= max_ckpt_to_keep:
-            keep_start = len(self.previous_saved_paths) - max_ckpt_to_keep + 1
-            self.remove_previous_save_local_path(self.previous_saved_paths[:keep_start])
-            self.previous_saved_paths = self.previous_saved_paths[keep_start:]
+        self._rotate_old_checkpoints(max_ckpt_to_keep)
 
         local_path = self.local_mkdir(local_path)
         torch.distributed.barrier()

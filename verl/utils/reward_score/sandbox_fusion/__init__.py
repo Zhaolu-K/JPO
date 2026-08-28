@@ -25,6 +25,40 @@ FaaS service provided by public cloud, eg: volcengine.com.
 logger = logging.getLogger(__name__)
 
 
+def _extract_generic_code_block(completion, solution):
+    """Extracts the code of a generic (non ```python) fenced block from the completion."""
+    parts = completion.split("```")
+    if len(parts) >= 2:
+        solution = parts[1]
+        # Remove potential language specifier like 'python\n'
+        if "\n" in solution:
+            first_line, rest = solution.split("\n", 1)
+            if first_line.strip().isalpha():  # Simple check for language name
+                solution = rest
+    return solution
+
+
+def _aggregate_score(res_list, metadata_list, continuous):
+    """Aggregates the per test case results into a score and its metadata."""
+    if continuous:
+        # Calculate pass rate for the first N (e.g., 10) test cases
+        num_to_consider = min(len(res_list), 10)
+        if num_to_consider == 0:
+            score = 0.0
+        else:
+            passed_count = sum(1 for r in res_list[:num_to_consider] if r is True)
+            score = passed_count / num_to_consider
+        # Return all metadata, even if score is based on the first N
+        final_metadata = metadata_list
+    else:
+        # Calculate pass rate for all test cases
+        passed_count = sum(1 for r in res_list if r is True)
+        total_cases = len(res_list)
+        score = passed_count / total_cases if total_cases > 0 else 0.0
+        final_metadata = metadata_list
+    return score, final_metadata
+
+
 def compute_score(sandbox_fusion_url, concurrent_semaphore, completion, test_cases, continuous=False, timeout=10):
     """
     Computes the code score using the remote sandbox API.
@@ -47,14 +81,7 @@ def compute_score(sandbox_fusion_url, concurrent_semaphore, completion, test_cas
         solution = completion.split("```python")[-1].split("```")[0]
     elif "```" in completion:
         # Handle cases like ```\ncode\n```
-        parts = completion.split("```")
-        if len(parts) >= 2:
-            solution = parts[1]
-            # Remove potential language specifier like 'python\n'
-            if "\n" in solution:
-                first_line, rest = solution.split("\n", 1)
-                if first_line.strip().isalpha():  # Simple check for language name
-                    solution = rest
+        solution = _extract_generic_code_block(completion, solution)
     else:
         return 0.0, [{"error": "Invalid completion (missing code block)"}]
 
@@ -80,22 +107,7 @@ def compute_score(sandbox_fusion_url, concurrent_semaphore, completion, test_cas
         if not res_list:  # If there are no results (e.g., invalid input)
             return 0.0, metadata_list
 
-        if continuous:
-            # Calculate pass rate for the first N (e.g., 10) test cases
-            num_to_consider = min(len(res_list), 10)
-            if num_to_consider == 0:
-                score = 0.0
-            else:
-                passed_count = sum(1 for r in res_list[:num_to_consider] if r is True)
-                score = passed_count / num_to_consider
-            # Return all metadata, even if score is based on the first N
-            final_metadata = metadata_list
-        else:
-            # Calculate pass rate for all test cases
-            passed_count = sum(1 for r in res_list if r is True)
-            total_cases = len(res_list)
-            score = passed_count / total_cases if total_cases > 0 else 0.0
-            final_metadata = metadata_list
+        score, final_metadata = _aggregate_score(res_list, metadata_list, continuous)
 
     except Exception as e:
         logger.error(f"Error during compute_score: {e}")

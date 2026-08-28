@@ -46,24 +46,12 @@ def _megatron_calc_layer_map(config):
     return layer_map
 
 
-def load_state_dict_to_megatron_qwen2(state_dict, wrapped_models, config, params_dtype, is_value_model=False, tie_word_embeddings=False):
-    """Load merged state_dict to sharded Megatron module in training."""
-    from megatron.core import DistributedDataParallel as LocalDDP
-    from megatron.core import mpu
-    from megatron.core.transformer.module import Float16Module
-    from torch.nn.parallel import DistributedDataParallel as torchDDP
+def _get_gpt_model(model):
+    return model
 
-    from verl.utils.megatron_utils import print_rank_0, unwrap_model
 
-    start_time = time.time()
-
-    def _get_gpt_model(model):
-        return model
-
-    def broadcast_params(module):
-        for param in module.parameters():
-            torch.distributed.broadcast(param.data, src=mpu.get_data_parallel_src_rank(), group=mpu.get_data_parallel_group())
-
+def _init_parallel_state(mpu):
+    """Query the parallel ranks and check the rank #0 invariants."""
     dp_rank = mpu.get_data_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -75,9 +63,11 @@ def load_state_dict_to_megatron_qwen2(state_dict, wrapped_models, config, params
         assert pp_rank == 0, f"pp_rank:[{pp_rank}] != 0 on rank #0"
         assert dp_rank == 0, f"dp_rank:[{dp_rank}] != 0 on rank #0"
 
-    if not isinstance(wrapped_models, (list, tuple)):
-        wrapped_models = list(wrapped_models)
+    return dp_rank, pp_rank, pp_size, virtual_pp_size, mp_group
 
+
+def _unwrap_megatron_models(wrapped_models, config, pp_size, virtual_pp_size, unwrap_model, torchDDP, LocalDDP, Float16Module):
+    """Unwrap the (virtual) pipeline stages and check their layer counts."""
     assert len(wrapped_models) == virtual_pp_size
     num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size
     assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers, f"num_layers_per_model: {num_layers_per_model} * pp_size: {pp_size} * virtual_pp_size: {virtual_pp_size} != config.num_hidden_layers: {config.num_hidden_layers}"
@@ -89,349 +79,424 @@ def load_state_dict_to_megatron_qwen2(state_dict, wrapped_models, config, params
         gpt_model_module = _get_gpt_model(models[i])
         assert len(gpt_model_module.model.layers) == num_layers_per_model
 
-    def _broadcast_tensor(tensor, name) -> torch.Tensor:
-        """broadcast tensor from rank0 across mp_group"""
-        nonlocal state_dict
-        nonlocal mp_group
-        if torch.distributed.get_rank() == 0:
-            if name in state_dict:
-                weight = state_dict[name]
-                tensor_shape = weight.shape
-            else:
-                tensor_shape = None
+    return models
+
+
+def _broadcast_tensor(tensor, name, state_dict, mp_group, params_dtype, print_rank_0) -> torch.Tensor:
+    """broadcast tensor from rank0 across mp_group"""
+    if torch.distributed.get_rank() == 0:
+        if name in state_dict:
+            weight = state_dict[name]
+            tensor_shape = weight.shape
         else:
-            weight = None
             tensor_shape = None
+    else:
+        weight = None
+        tensor_shape = None
 
-        obj_list = [tensor_shape]
-        dist.broadcast_object_list(obj_list, src=0, group=mp_group)
-        tensor_shape = obj_list[0]
+    obj_list = [tensor_shape]
+    dist.broadcast_object_list(obj_list, src=0, group=mp_group)
+    tensor_shape = obj_list[0]
 
-        if tensor_shape is None:
-            # all or none ranks in the mp_group should reach here
-            print_rank_0(f"tensor:[{name}] not in state_dict, skip load")
-            return
+    if tensor_shape is None:
+        # all or none ranks in the mp_group should reach here
+        print_rank_0(f"tensor:[{name}] not in state_dict, skip load")
+        return
 
-        if tensor is None:
-            tensor = torch.empty(
-                tensor_shape,
-                dtype=params_dtype,
-                device=torch.cuda.current_device(),
-                requires_grad=False,
-            )
-        if torch.distributed.get_rank() == 0:
-            tensor.data.copy_(weight)
-        dist.broadcast(tensor, src=0, group=mp_group)
+    if tensor is None:
+        tensor = torch.empty(
+            tensor_shape,
+            dtype=params_dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=False,
+        )
+    if torch.distributed.get_rank() == 0:
+        tensor.data.copy_(weight)
+    dist.broadcast(tensor, src=0, group=mp_group)
 
-    def _broadcast_tp_shard_tensor_vocab(tensor, name, chunk_dim=0, mutate_func=None) -> torch.Tensor:
-        """broadcast tensor in tp shards across mp_group"""
-        nonlocal state_dict
-        nonlocal mp_group
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        tp_size = mpu.get_tensor_model_parallel_world_size()
 
-        if torch.distributed.get_rank() == 0:
-            if name in state_dict:
-                full_weight = state_dict[name]
+def _broadcast_tp_shard_tensor_vocab(tensor, name, state_dict, mp_group, mpu, params_dtype, print_rank_0, chunk_dim=0, mutate_func=None) -> torch.Tensor:
+    """broadcast tensor in tp shards across mp_group"""
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
 
-                if mutate_func is not None:
-                    full_weight = mutate_func(full_weight)
-                tensor_chunk = torch.chunk(full_weight, tp_size, dim=chunk_dim)
-                chunk_shape = tensor_chunk[0].shape
-            else:
-                chunk_shape = None
+    if torch.distributed.get_rank() == 0:
+        if name in state_dict:
+            full_weight = state_dict[name]
+
+            if mutate_func is not None:
+                full_weight = mutate_func(full_weight)
+            tensor_chunk = torch.chunk(full_weight, tp_size, dim=chunk_dim)
+            chunk_shape = tensor_chunk[0].shape
         else:
             chunk_shape = None
+    else:
+        chunk_shape = None
 
-        obj_list = [chunk_shape]
-        dist.broadcast_object_list(obj_list, src=0, group=mp_group)
-        chunk_shape = obj_list[0]
-        if chunk_shape is None:
-            # all or none ranks in the mp_group should reach here
-            print_rank_0(f"tp_shard tensor:[{name}] not in state_dict, skip loading")
-            return
+    obj_list = [chunk_shape]
+    dist.broadcast_object_list(obj_list, src=0, group=mp_group)
+    chunk_shape = obj_list[0]
+    if chunk_shape is None:
+        # all or none ranks in the mp_group should reach here
+        print_rank_0(f"tp_shard tensor:[{name}] not in state_dict, skip loading")
+        return
 
-        if tensor is None:
-            sync_tensor = torch.empty(
-                chunk_shape,
-                dtype=params_dtype,
-                device=torch.cuda.current_device(),
-                requires_grad=False,
-            )
-        else:
-            assert tensor.shape == chunk_shape, f"rank #{torch.distributed.get_rank()} tensor {name} shape {tensor.shape} != {chunk_shape}"
-            sync_tensor = torch.empty_like(tensor, device=torch.cuda.current_device(), requires_grad=False)
+    if tensor is None:
+        sync_tensor = torch.empty(
+            chunk_shape,
+            dtype=params_dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=False,
+        )
+    else:
+        assert tensor.shape == chunk_shape, f"rank #{torch.distributed.get_rank()} tensor {name} shape {tensor.shape} != {chunk_shape}"
+        sync_tensor = torch.empty_like(tensor, device=torch.cuda.current_device(), requires_grad=False)
 
-        for i in range(tp_size):
-            if torch.distributed.get_rank() == 0:
-                sync_tensor.data.copy_(tensor_chunk[i])
-            dist.broadcast(sync_tensor, src=0, group=mp_group)
-            if (i == tp_rank) and (tensor is not None):
-                tensor.data.copy_(sync_tensor)
-
-    def _broadcast_tp_shard_tensor(tensor, name, chunk_dim=0, mutate_func=None) -> torch.Tensor:
-        """broadcast tensor in tp shards across mp_group"""
-        nonlocal state_dict
-        nonlocal mp_group
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-
+    for i in range(tp_size):
         if torch.distributed.get_rank() == 0:
-            if name in state_dict:
-                full_weight = state_dict[name]
-                if mutate_func is not None:
-                    full_weight = mutate_func(full_weight)
-                tensor_chunk = torch.chunk(full_weight, tp_size, dim=chunk_dim)
-                chunk_shape = tensor_chunk[0].shape
-            else:
-                chunk_shape = None
+            sync_tensor.data.copy_(tensor_chunk[i])
+        dist.broadcast(sync_tensor, src=0, group=mp_group)
+        if (i == tp_rank) and (tensor is not None):
+            tensor.data.copy_(sync_tensor)
+
+
+def _broadcast_tp_shard_tensor(tensor, name, state_dict, mp_group, mpu, params_dtype, print_rank_0, chunk_dim=0, mutate_func=None) -> torch.Tensor:
+    """broadcast tensor in tp shards across mp_group"""
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+
+    if torch.distributed.get_rank() == 0:
+        if name in state_dict:
+            full_weight = state_dict[name]
+            if mutate_func is not None:
+                full_weight = mutate_func(full_weight)
+            tensor_chunk = torch.chunk(full_weight, tp_size, dim=chunk_dim)
+            chunk_shape = tensor_chunk[0].shape
         else:
             chunk_shape = None
+    else:
+        chunk_shape = None
 
-        obj_list = [chunk_shape]
-        dist.broadcast_object_list(obj_list, src=0, group=mp_group)
-        chunk_shape = obj_list[0]
-        if chunk_shape is None:
-            # all or none ranks in the mp_group should reach here
-            print_rank_0(f"tp_shard tensor:[{name}] not in state_dict, skip loading")
-            return
+    obj_list = [chunk_shape]
+    dist.broadcast_object_list(obj_list, src=0, group=mp_group)
+    chunk_shape = obj_list[0]
+    if chunk_shape is None:
+        # all or none ranks in the mp_group should reach here
+        print_rank_0(f"tp_shard tensor:[{name}] not in state_dict, skip loading")
+        return
 
-        if tensor is None:
-            sync_tensor = torch.empty(
-                chunk_shape,
-                dtype=params_dtype,
-                device=torch.cuda.current_device(),
-                requires_grad=False,
-            )
-        else:
-            assert tensor.shape == chunk_shape, f"rank #{torch.distributed.get_rank()} tensor {name} shape {tensor.shape} != {chunk_shape}"
-            sync_tensor = torch.empty_like(tensor, device=torch.cuda.current_device(), requires_grad=False)
+    if tensor is None:
+        sync_tensor = torch.empty(
+            chunk_shape,
+            dtype=params_dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=False,
+        )
+    else:
+        assert tensor.shape == chunk_shape, f"rank #{torch.distributed.get_rank()} tensor {name} shape {tensor.shape} != {chunk_shape}"
+        sync_tensor = torch.empty_like(tensor, device=torch.cuda.current_device(), requires_grad=False)
 
-        for i in range(tp_size):
-            if torch.distributed.get_rank() == 0:
-                sync_tensor.data.copy_(tensor_chunk[i])
-            dist.broadcast(sync_tensor, src=0, group=mp_group)
-            if (i == tp_rank) and (tensor is not None):
-                tensor.data.copy_(sync_tensor)
-
-    def _broadcast_tp_shard_tensor_gate_up(tensor, gate_name, up_name) -> torch.Tensor:
-        """broadcast tensor in tp shards across mp_group"""
-        nonlocal state_dict
-        nonlocal mp_group
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-
+    for i in range(tp_size):
         if torch.distributed.get_rank() == 0:
-            gate_weight = state_dict[gate_name]
-            up_weight = state_dict[up_name]
-            new_gate_up_weight = torch.empty(config.intermediate_size * 2, config.hidden_size, dtype=params_dtype, device=torch.cuda.current_device())
+            sync_tensor.data.copy_(tensor_chunk[i])
+        dist.broadcast(sync_tensor, src=0, group=mp_group)
+        if (i == tp_rank) and (tensor is not None):
+            tensor.data.copy_(sync_tensor)
+
+
+def _broadcast_tp_shard_tensor_gate_up(tensor, gate_name, up_name, state_dict, mp_group, mpu, config, params_dtype, print_rank_0) -> torch.Tensor:
+    """broadcast tensor in tp shards across mp_group"""
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+
+    if torch.distributed.get_rank() == 0:
+        gate_weight = state_dict[gate_name]
+        up_weight = state_dict[up_name]
+        new_gate_up_weight = torch.empty(config.intermediate_size * 2, config.hidden_size, dtype=params_dtype, device=torch.cuda.current_device())
+        for i in range(tp_size):
+            intermediate_size_tp = config.intermediate_size // tp_size
+            gate_weight_tp = gate_weight[i * intermediate_size_tp : (i + 1) * intermediate_size_tp]
+            up_weight_tp = up_weight[i * intermediate_size_tp : (i + 1) * intermediate_size_tp]
+            new_gate_up_weight[intermediate_size_tp * 2 * i : intermediate_size_tp * 2 * (i + 1)].copy_(torch.cat([gate_weight_tp, up_weight_tp], dim=0))
+
+        tensor_chunk = torch.chunk(new_gate_up_weight, tp_size, dim=0)
+        chunk_shape = tensor_chunk[0].shape
+    else:
+        chunk_shape = None
+
+    obj_list = [chunk_shape]
+    dist.broadcast_object_list(obj_list, src=0, group=mp_group)
+    chunk_shape = obj_list[0]
+    if chunk_shape is None:
+        # all or none ranks in the mp_group should reach here
+        print_rank_0(f"tp_shard tensor:[{gate_name, up_name}] not in state_dict, skip loading")
+        return
+
+    if tensor is None:
+        sync_tensor = torch.empty(
+            chunk_shape,
+            dtype=params_dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=False,
+        )
+    else:
+        assert tensor.shape == chunk_shape, f"rank #{torch.distributed.get_rank() == 0:} tensor {gate_name, up_name} shape {tensor.shape} != {chunk_shape}"
+        sync_tensor = torch.empty_like(tensor, device=torch.cuda.current_device(), requires_grad=False)
+
+    for i in range(tp_size):
+        if torch.distributed.get_rank() == 0:
+            sync_tensor.data.copy_(tensor_chunk[i])
+        dist.broadcast(sync_tensor, src=0, group=mp_group)
+        if (i == tp_rank) and (tensor is not None):
+            tensor.data.copy_(sync_tensor)
+
+
+def _broadcast_tp_shard_tensor_qkv(tensor, q_name, k_name, v_name, state_dict, mp_group, mpu, config, params_dtype, print_rank_0, bias=False) -> torch.Tensor:
+    """broadcast tensor in tp shards across mp_group"""
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+
+    if torch.distributed.get_rank() == 0:
+        assert q_name in state_dict and k_name in state_dict and v_name in state_dict
+        full_weight_q = state_dict[q_name]
+        full_weight_k = state_dict[k_name]
+        full_weight_v = state_dict[v_name]
+
+        hidden_size_per_head = config.hidden_size // config.num_attention_heads
+
+        if config.num_key_value_heads >= tp_size:
+            q_size_tp = config.hidden_size // tp_size
+            kv_size_tp = hidden_size_per_head * config.num_key_value_heads // tp_size
+            total_size = q_size_tp + 2 * kv_size_tp
+            if not bias:
+                new_weight_qkv = torch.empty(total_size * tp_size, config.hidden_size, dtype=params_dtype, device=torch.cuda.current_device())
+            else:
+                new_weight_qkv = torch.empty(total_size * tp_size, dtype=params_dtype, device=torch.cuda.current_device())
             for i in range(tp_size):
-                intermediate_size_tp = config.intermediate_size // tp_size
-                gate_weight_tp = gate_weight[i * intermediate_size_tp : (i + 1) * intermediate_size_tp]
-                up_weight_tp = up_weight[i * intermediate_size_tp : (i + 1) * intermediate_size_tp]
-                new_gate_up_weight[intermediate_size_tp * 2 * i : intermediate_size_tp * 2 * (i + 1)].copy_(torch.cat([gate_weight_tp, up_weight_tp], dim=0))
+                q_part = full_weight_q[i * q_size_tp : (i + 1) * q_size_tp]
+                k_part = full_weight_k[i * kv_size_tp : (i + 1) * kv_size_tp]
+                v_part = full_weight_v[i * kv_size_tp : (i + 1) * kv_size_tp]
+                new_weight_qkv[i * total_size : (i + 1) * total_size].copy_(torch.cat([q_part, k_part, v_part], dim=0))
 
-            tensor_chunk = torch.chunk(new_gate_up_weight, tp_size, dim=0)
-            chunk_shape = tensor_chunk[0].shape
         else:
-            chunk_shape = None
-
-        obj_list = [chunk_shape]
-        dist.broadcast_object_list(obj_list, src=0, group=mp_group)
-        chunk_shape = obj_list[0]
-        if chunk_shape is None:
-            # all or none ranks in the mp_group should reach here
-            print_rank_0(f"tp_shard tensor:[{gate_name, up_name}] not in state_dict, skip loading")
-            return
-
-        if tensor is None:
-            sync_tensor = torch.empty(
-                chunk_shape,
-                dtype=params_dtype,
-                device=torch.cuda.current_device(),
-                requires_grad=False,
-            )
-        else:
-            assert tensor.shape == chunk_shape, f"rank #{torch.distributed.get_rank() == 0:} tensor {gate_name, up_name} shape {tensor.shape} != {chunk_shape}"
-            sync_tensor = torch.empty_like(tensor, device=torch.cuda.current_device(), requires_grad=False)
-
-        for i in range(tp_size):
-            if torch.distributed.get_rank() == 0:
-                sync_tensor.data.copy_(tensor_chunk[i])
-            dist.broadcast(sync_tensor, src=0, group=mp_group)
-            if (i == tp_rank) and (tensor is not None):
-                tensor.data.copy_(sync_tensor)
-
-    def _broadcast_tp_shard_tensor_qkv(tensor, q_name, k_name, v_name, bias=False) -> torch.Tensor:
-        """broadcast tensor in tp shards across mp_group"""
-        nonlocal state_dict
-        nonlocal mp_group
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-
-        if torch.distributed.get_rank() == 0:
-            assert q_name in state_dict and k_name in state_dict and v_name in state_dict
-            full_weight_q = state_dict[q_name]
-            full_weight_k = state_dict[k_name]
-            full_weight_v = state_dict[v_name]
-
-            hidden_size_per_head = config.hidden_size // config.num_attention_heads
-
-            if config.num_key_value_heads >= tp_size:
-                q_size_tp = config.hidden_size // tp_size
-                kv_size_tp = hidden_size_per_head * config.num_key_value_heads // tp_size
-                total_size = q_size_tp + 2 * kv_size_tp
-                if not bias:
-                    new_weight_qkv = torch.empty(total_size * tp_size, config.hidden_size, dtype=params_dtype, device=torch.cuda.current_device())
-                else:
-                    new_weight_qkv = torch.empty(total_size * tp_size, dtype=params_dtype, device=torch.cuda.current_device())
-                for i in range(tp_size):
-                    q_part = full_weight_q[i * q_size_tp : (i + 1) * q_size_tp]
-                    k_part = full_weight_k[i * kv_size_tp : (i + 1) * kv_size_tp]
-                    v_part = full_weight_v[i * kv_size_tp : (i + 1) * kv_size_tp]
-                    new_weight_qkv[i * total_size : (i + 1) * total_size].copy_(torch.cat([q_part, k_part, v_part], dim=0))
-
+            q_size_tp = config.hidden_size // tp_size
+            kv_size_tp = hidden_size_per_head
+            total_size = q_size_tp + 2 * kv_size_tp
+            if not bias:
+                new_weight_qkv = torch.empty(total_size * tp_size, config.hidden_size, dtype=params_dtype, device=torch.cuda.current_device())
             else:
-                q_size_tp = config.hidden_size // tp_size
-                kv_size_tp = hidden_size_per_head
-                total_size = q_size_tp + 2 * kv_size_tp
-                if not bias:
-                    new_weight_qkv = torch.empty(total_size * tp_size, config.hidden_size, dtype=params_dtype, device=torch.cuda.current_device())
-                else:
-                    new_weight_qkv = torch.empty(total_size * tp_size, dtype=params_dtype, device=torch.cuda.current_device())
-                for i in range(tp_size):
-                    q_part = full_weight_q[i * q_size_tp : (i + 1) * q_size_tp]
-                    start_idx = i * config.num_key_value_heads // tp_size * hidden_size_per_head
-                    end_idx = (i * config.num_key_value_heads // tp_size + 1) * hidden_size_per_head
-                    k_part = full_weight_k[start_idx:end_idx]
-                    v_part = full_weight_v[start_idx:end_idx]
-                    new_weight_qkv[i * total_size : (i + 1) * total_size].copy_(torch.cat([q_part, k_part, v_part], dim=0))
+                new_weight_qkv = torch.empty(total_size * tp_size, dtype=params_dtype, device=torch.cuda.current_device())
+            for i in range(tp_size):
+                q_part = full_weight_q[i * q_size_tp : (i + 1) * q_size_tp]
+                start_idx = i * config.num_key_value_heads // tp_size * hidden_size_per_head
+                end_idx = (i * config.num_key_value_heads // tp_size + 1) * hidden_size_per_head
+                k_part = full_weight_k[start_idx:end_idx]
+                v_part = full_weight_v[start_idx:end_idx]
+                new_weight_qkv[i * total_size : (i + 1) * total_size].copy_(torch.cat([q_part, k_part, v_part], dim=0))
 
-            tensor_chunk = torch.chunk(new_weight_qkv, tp_size, dim=0)
-            chunk_shape = tensor_chunk[0].shape
+        tensor_chunk = torch.chunk(new_weight_qkv, tp_size, dim=0)
+        chunk_shape = tensor_chunk[0].shape
+    else:
+        chunk_shape = None
+
+    obj_list = [chunk_shape]
+    dist.broadcast_object_list(obj_list, src=0, group=mp_group)
+    chunk_shape = obj_list[0]
+    if chunk_shape is None:
+        # all or none ranks in the mp_group should reach here
+        print_rank_0(f"tp_shard tensor:[{q_name, k_name, v_name}] not in state_dict, skip loading")
+        return
+
+    if tensor is None:
+        sync_tensor = torch.empty(
+            chunk_shape,
+            dtype=params_dtype,
+            device=torch.cuda.current_device(),
+            requires_grad=False,
+        )
+    else:
+        assert tensor.shape == chunk_shape, f"rank #{torch.distributed.get_rank()} tensor {q_name} shape {tensor.shape} != {chunk_shape}"
+        sync_tensor = torch.empty_like(tensor, device=torch.cuda.current_device(), requires_grad=False)
+
+    for i in range(tp_size):
+        if torch.distributed.get_rank() == 0:
+            sync_tensor.data.copy_(tensor_chunk[i])
+        dist.broadcast(sync_tensor, src=0, group=mp_group)
+        if (i == tp_rank) and (tensor is not None):
+            tensor.data.copy_(sync_tensor)
+
+
+def _load_embeddings(models, pp_rank, state_dict, mp_group, mpu, params_dtype, print_rank_0):
+    """Load the word embeddings into the first pipeline stage."""
+    print_rank_0("loading embeddings...")
+    gpt_model_module = _get_gpt_model(models[0])
+    embed_tokens_weight = None
+    if pp_rank == 0:
+        embed_tokens_weight = gpt_model_module.model.embed_tokens.weight
+    _broadcast_tp_shard_tensor_vocab(embed_tokens_weight, "model.embed_tokens.weight", state_dict, mp_group, mpu, params_dtype, print_rank_0)
+
+
+def _load_transformer_layer(layer, layer_map, models, pp_rank, state_dict, mp_group, mpu, config, params_dtype, print_rank_0):
+    """Load a single transformer layer into the model chunk that owns it."""
+    print_rank_0(f"loading layer #{layer}...")
+    layer_name = f"model.layers.{layer}"
+    dst_pp_rank, dst_virtual_pp_rank, dst_layer_idx = layer_map[layer]
+
+    gpt_model_module = _get_gpt_model(models[dst_virtual_pp_rank])
+    sync_layer = gpt_model_module.model.layers[dst_layer_idx]
+
+    _broadcast_tensor(
+        sync_layer.input_layernorm.weight if dst_pp_rank == pp_rank else None,
+        f"{layer_name}.input_layernorm.weight",
+        state_dict,
+        mp_group,
+        params_dtype,
+        print_rank_0,
+    )
+
+    _broadcast_tp_shard_tensor_qkv(
+        sync_layer.self_attn.qkv_proj.weight if dst_pp_rank == pp_rank else None,
+        f"{layer_name}.self_attn.q_proj.weight",
+        f"{layer_name}.self_attn.k_proj.weight",
+        f"{layer_name}.self_attn.v_proj.weight",
+        state_dict,
+        mp_group,
+        mpu,
+        config,
+        params_dtype,
+        print_rank_0,
+    )
+
+    _broadcast_tp_shard_tensor_qkv(
+        sync_layer.self_attn.qkv_proj.bias if dst_pp_rank == pp_rank else None,
+        f"{layer_name}.self_attn.q_proj.bias",
+        f"{layer_name}.self_attn.k_proj.bias",
+        f"{layer_name}.self_attn.v_proj.bias",
+        state_dict,
+        mp_group,
+        mpu,
+        config,
+        params_dtype,
+        print_rank_0,
+        bias=True,
+    )
+
+    _broadcast_tp_shard_tensor(
+        sync_layer.self_attn.o_proj.weight if dst_pp_rank == pp_rank else None,
+        f"{layer_name}.self_attn.o_proj.weight",
+        state_dict,
+        mp_group,
+        mpu,
+        params_dtype,
+        print_rank_0,
+        chunk_dim=1,
+    )
+
+    _broadcast_tensor(
+        sync_layer.post_attention_layernorm.weight if dst_pp_rank == pp_rank else None,
+        f"{layer_name}.post_attention_layernorm.weight",
+        state_dict,
+        mp_group,
+        params_dtype,
+        print_rank_0,
+    )
+
+    _broadcast_tp_shard_tensor_gate_up(
+        sync_layer.mlp.gate_up_proj.weight if dst_pp_rank == pp_rank else None,
+        f"{layer_name}.mlp.gate_proj.weight",
+        f"{layer_name}.mlp.up_proj.weight",
+        state_dict,
+        mp_group,
+        mpu,
+        config,
+        params_dtype,
+        print_rank_0,
+    )
+
+    _broadcast_tp_shard_tensor(
+        sync_layer.mlp.down_proj.weight if dst_pp_rank == pp_rank else None,
+        f"{layer_name}.mlp.down_proj.weight",
+        state_dict,
+        mp_group,
+        mpu,
+        params_dtype,
+        print_rank_0,
+        chunk_dim=1,
+    )
+
+
+def _load_final_layernorm_and_lm_head(models, pp_rank, pp_size, state_dict, mp_group, mpu, params_dtype, print_rank_0, is_value_model, tie_word_embeddings):
+    """Load the final layernorm and the lm_head into the last pipeline stage."""
+    print_rank_0("loading final layernorm...")
+    gpt_model_module = _get_gpt_model(models[-1])
+    _broadcast_tensor(
+        getattr(gpt_model_module.model.norm, "weight", None),
+        "model.norm.weight",
+        state_dict,
+        mp_group,
+        params_dtype,
+        print_rank_0,
+    )
+
+    if tie_word_embeddings:
+        print_rank_0("tie_word_embeddings skip load lm_head")
+    else:
+        print_rank_0("loading lm_head...")
+        lm_head_weight = None
+        if pp_rank + 1 == pp_size:
+            lm_head_weight = gpt_model_module.lm_head.weight
+
+        if is_value_model:
+            if "lm_head.weight" in state_dict and state_dict["lm_head.weight"].shape[0] == 1:
+                _broadcast_tensor(lm_head_weight, "lm_head.weight", state_dict, mp_group, params_dtype, print_rank_0)
+                print_rank_0("load lm_head from value_head weight")
+            elif "reward_head.weight" in state_dict and state_dict["reward_head.weight"].shape[0] == 1:
+                _broadcast_tensor(lm_head_weight, "reward_head.weight", state_dict, mp_group, params_dtype, print_rank_0)
+                print_rank_0("load lm_head from value_head weight")
+            else:
+                _broadcast_tensor(None, "lm_head.weight", state_dict, mp_group, params_dtype, print_rank_0)
+                print_rank_0("fail to match lm_head in value_model")
+
         else:
-            chunk_shape = None
+            _broadcast_tp_shard_tensor(lm_head_weight, "lm_head.weight", state_dict, mp_group, mpu, params_dtype, print_rank_0)
 
-        obj_list = [chunk_shape]
-        dist.broadcast_object_list(obj_list, src=0, group=mp_group)
-        chunk_shape = obj_list[0]
-        if chunk_shape is None:
-            # all or none ranks in the mp_group should reach here
-            print_rank_0(f"tp_shard tensor:[{q_name, k_name, v_name}] not in state_dict, skip loading")
-            return
 
-        if tensor is None:
-            sync_tensor = torch.empty(
-                chunk_shape,
-                dtype=params_dtype,
-                device=torch.cuda.current_device(),
-                requires_grad=False,
-            )
-        else:
-            assert tensor.shape == chunk_shape, f"rank #{torch.distributed.get_rank()} tensor {q_name} shape {tensor.shape} != {chunk_shape}"
-            sync_tensor = torch.empty_like(tensor, device=torch.cuda.current_device(), requires_grad=False)
+def load_state_dict_to_megatron_qwen2(state_dict, wrapped_models, config, params_dtype, is_value_model=False, tie_word_embeddings=False):
+    """Load merged state_dict to sharded Megatron module in training."""
+    from megatron.core import DistributedDataParallel as LocalDDP
+    from megatron.core import mpu
+    from megatron.core.transformer.module import Float16Module
+    from torch.nn.parallel import DistributedDataParallel as torchDDP
 
-        for i in range(tp_size):
-            if torch.distributed.get_rank() == 0:
-                sync_tensor.data.copy_(tensor_chunk[i])
-            dist.broadcast(sync_tensor, src=0, group=mp_group)
-            if (i == tp_rank) and (tensor is not None):
-                tensor.data.copy_(sync_tensor)
+    from verl.utils.megatron_utils import print_rank_0, unwrap_model
+
+    start_time = time.time()
+
+    def broadcast_params(module):
+        for param in module.parameters():
+            torch.distributed.broadcast(param.data, src=mpu.get_data_parallel_src_rank(), group=mpu.get_data_parallel_group())
+
+    dp_rank, pp_rank, pp_size, virtual_pp_size, mp_group = _init_parallel_state(mpu)
+
+    if not isinstance(wrapped_models, (list, tuple)):
+        wrapped_models = list(wrapped_models)
+
+    models = _unwrap_megatron_models(wrapped_models, config, pp_size, virtual_pp_size, unwrap_model, torchDDP, LocalDDP, Float16Module)
 
     if dp_rank == 0:
         # Embeddings
         # -------------------
-        print_rank_0("loading embeddings...")
-        gpt_model_module = _get_gpt_model(models[0])
-        embed_tokens_weight = None
-        if pp_rank == 0:
-            embed_tokens_weight = gpt_model_module.model.embed_tokens.weight
-        _broadcast_tp_shard_tensor_vocab(embed_tokens_weight, "model.embed_tokens.weight")
+        _load_embeddings(models, pp_rank, state_dict, mp_group, mpu, params_dtype, print_rank_0)
 
         # Transformer layers
         # -------------------
         layer_map = _megatron_calc_layer_map(config)
 
         for layer in range(config.num_hidden_layers):
-            print_rank_0(f"loading layer #{layer}...")
-            layer_name = f"model.layers.{layer}"
-            dst_pp_rank, dst_virtual_pp_rank, dst_layer_idx = layer_map[layer]
-
-            gpt_model_module = _get_gpt_model(models[dst_virtual_pp_rank])
-            sync_layer = gpt_model_module.model.layers[dst_layer_idx]
-
-            _broadcast_tensor(
-                sync_layer.input_layernorm.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.input_layernorm.weight",
-            )
-
-            _broadcast_tp_shard_tensor_qkv(
-                sync_layer.self_attn.qkv_proj.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.self_attn.q_proj.weight",
-                f"{layer_name}.self_attn.k_proj.weight",
-                f"{layer_name}.self_attn.v_proj.weight",
-            )
-
-            _broadcast_tp_shard_tensor_qkv(
-                sync_layer.self_attn.qkv_proj.bias if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.self_attn.q_proj.bias",
-                f"{layer_name}.self_attn.k_proj.bias",
-                f"{layer_name}.self_attn.v_proj.bias",
-                bias=True,
-            )
-
-            _broadcast_tp_shard_tensor(
-                sync_layer.self_attn.o_proj.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.self_attn.o_proj.weight",
-                chunk_dim=1,
-            )
-
-            _broadcast_tensor(
-                sync_layer.post_attention_layernorm.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.post_attention_layernorm.weight",
-            )
-
-            _broadcast_tp_shard_tensor_gate_up(
-                sync_layer.mlp.gate_up_proj.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.mlp.gate_proj.weight",
-                f"{layer_name}.mlp.up_proj.weight",
-            )
-
-            _broadcast_tp_shard_tensor(
-                sync_layer.mlp.down_proj.weight if dst_pp_rank == pp_rank else None,
-                f"{layer_name}.mlp.down_proj.weight",
-                chunk_dim=1,
-            )
+            _load_transformer_layer(layer, layer_map, models, pp_rank, state_dict, mp_group, mpu, config, params_dtype, print_rank_0)
         # Final Layernorm
         # -------------------
-        print_rank_0("loading final layernorm...")
-        gpt_model_module = _get_gpt_model(models[-1])
-        _broadcast_tensor(
-            getattr(gpt_model_module.model.norm, "weight", None),
-            "model.norm.weight",
-        )
-
-        if tie_word_embeddings:
-            print_rank_0("tie_word_embeddings skip load lm_head")
-        else:
-            print_rank_0("loading lm_head...")
-            lm_head_weight = None
-            if pp_rank + 1 == pp_size:
-                lm_head_weight = gpt_model_module.lm_head.weight
-
-            if is_value_model:
-                if "lm_head.weight" in state_dict and state_dict["lm_head.weight"].shape[0] == 1:
-                    _broadcast_tensor(lm_head_weight, "lm_head.weight")
-                    print_rank_0("load lm_head from value_head weight")
-                elif "reward_head.weight" in state_dict and state_dict["reward_head.weight"].shape[0] == 1:
-                    _broadcast_tensor(lm_head_weight, "reward_head.weight")
-                    print_rank_0("load lm_head from value_head weight")
-                else:
-                    _broadcast_tensor(None, "lm_head.weight")
-                    print_rank_0("fail to match lm_head in value_model")
-
-            else:
-                _broadcast_tp_shard_tensor(lm_head_weight, "lm_head.weight")
+        _load_final_layernorm_and_lm_head(models, pp_rank, pp_size, state_dict, mp_group, mpu, params_dtype, print_rank_0, is_value_model, tie_word_embeddings)
 
     dist.barrier()
     # Broadcast weights inside data parallel groups
